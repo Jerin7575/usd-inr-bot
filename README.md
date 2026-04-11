@@ -76,4 +76,7 @@ usd-inr-bot/
 ⚠️ Disclaimer
 This bot is for informational purposes only and does not constitute financial advice. Always do your own research before making any trading decisions.
 👤 Author
-Created by [jerin\_7575](https://www.instagram.com/jerin_7575?igsh=MWVuZ211MHluOXFsNA==)
+Created by jerin7575
+```
+Instagram 
+[jerin\_7575](https://www.instagram.com/jerin_7575?igsh=MWVuZ211MHluOXFsNA==)
