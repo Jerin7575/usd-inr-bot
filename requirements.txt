@@ -6,3 +6,6 @@ matplotlib
 python-telegram-bot
 python-dotenv
 nest_asyncio
+xgboost
+tensorflow
+scikit-learn
