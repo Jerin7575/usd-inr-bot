@@ -1,6 +1,8 @@
 import os
 import io
+import warnings
 import nest_asyncio
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -9,34 +11,33 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from prophet import Prophet
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot, BotCommand
+from xgboost import XGBRegressor
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# ── Load Token ─────────────────────────────────────────────────
+warnings.filterwarnings("ignore")
 load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN environment variable not set!")
+    raise ValueError("❌ BOT_TOKEN not set!")
 
 nest_asyncio.apply()
 
 # ── Horizons ───────────────────────────────────────────────────
 HORIZONS = {
-    "10 mins":  "10min",
-    "30 mins":  "30min",
-    "1 hour":   "60min",
-    "3 hours":  "180min",
-    "6 hours":  "360min",
-    "12 hours": "720min",
-    "1 day":    "1440min",
-    "3 days":   "4320min",
-    "1 week":   "10080min",
-}
-
-OFFSET_MINS = {
-    "10 mins": 10, "30 mins": 30, "1 hour": 60,
-    "3 hours": 180, "6 hours": 360, "12 hours": 720,
-    "1 day": 1440, "3 days": 4320, "1 week": 10080,
+    "10 mins":  10,
+    "30 mins":  30,
+    "1 hour":   60,
+    "3 hours":  180,
+    "6 hours":  360,
+    "12 hours": 720,
+    "1 day":    1440,
+    "3 days":   4320,
+    "1 week":   10080,
 }
 
 SIGNAL_COLORS = {
@@ -61,6 +62,93 @@ def get_current_price():
     data = ticker.history(period="1d", interval="1m")
     return round(data['Close'].iloc[-1], 4)
 
+# ── Feature Engineering ────────────────────────────────────────
+def add_features(df):
+    df = df.copy()
+    df['lag_1']  = df['y'].shift(1)
+    df['lag_2']  = df['y'].shift(2)
+    df['lag_3']  = df['y'].shift(3)
+    df['lag_6']  = df['y'].shift(6)
+    df['lag_12'] = df['y'].shift(12)
+    df['lag_24'] = df['y'].shift(24)
+    df['rolling_mean_6']  = df['y'].rolling(6).mean()
+    df['rolling_mean_24'] = df['y'].rolling(24).mean()
+    df['rolling_std_6']   = df['y'].rolling(6).std()
+    df['rolling_std_24']  = df['y'].rolling(24).std()
+    df['hour']      = df['ds'].dt.hour
+    df['dayofweek'] = df['ds'].dt.dayofweek
+    df['month']     = df['ds'].dt.month
+    df.dropna(inplace=True)
+    return df
+
+# ── Prophet ────────────────────────────────────────────────────
+def prophet_predict(df, minutes):
+    model = Prophet(
+        changepoint_prior_scale=0.05,
+        daily_seasonality=True,
+        weekly_seasonality=True
+    )
+    model.fit(df[['ds', 'y']])
+    future   = model.make_future_dataframe(periods=1, freq=f"{minutes}min")
+    forecast = model.predict(future)
+    pred  = forecast['yhat'].iloc[-1]
+    upper = forecast['yhat_upper'].iloc[-1]
+    lower = forecast['yhat_lower'].iloc[-1]
+    return pred, upper, lower
+
+# ── LSTM ───────────────────────────────────────────────────────
+def lstm_predict(df):
+    scaler  = MinMaxScaler()
+    values  = df['y'].values.reshape(-1, 1)
+    scaled  = scaler.fit_transform(values)
+
+    SEQ_LEN = 24
+    X, y = [], []
+    for i in range(SEQ_LEN, len(scaled)):
+        X.append(scaled[i-SEQ_LEN:i, 0])
+        y.append(scaled[i, 0])
+
+    X = np.array(X).reshape(-1, SEQ_LEN, 1)
+    y = np.array(y)
+
+    model = Sequential([
+        LSTM(64, return_sequences=True, input_shape=(SEQ_LEN, 1)),
+        Dropout(0.2),
+        LSTM(32),
+        Dropout(0.2),
+        Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='mse')
+    model.fit(X, y, epochs=10, batch_size=16, verbose=0)
+
+    last_seq    = scaled[-SEQ_LEN:].reshape(1, SEQ_LEN, 1)
+    pred_scaled = model.predict(last_seq, verbose=0)[0][0]
+    pred        = scaler.inverse_transform([[pred_scaled]])[0][0]
+    return round(pred, 4)
+
+# ── XGBoost ────────────────────────────────────────────────────
+def xgboost_predict(df):
+    df_feat  = add_features(df)
+    features = [
+        'lag_1','lag_2','lag_3','lag_6','lag_12','lag_24',
+        'rolling_mean_6','rolling_mean_24','rolling_std_6',
+        'rolling_std_24','hour','dayofweek','month'
+    ]
+    X = df_feat[features]
+    y = df_feat['y']
+
+    model = XGBRegressor(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=5,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42
+    )
+    model.fit(X, y)
+    pred = model.predict(X.iloc[-1].values.reshape(1, -1))[0]
+    return round(pred, 4)
+
 # ── Signal Logic ───────────────────────────────────────────────
 def get_signal(pct, confidence):
     if confidence > 0.005:
@@ -76,37 +164,53 @@ def get_signal(pct, confidence):
     else:
         return "⚪ HOLD"
 
-# ── Prediction Model ───────────────────────────────────────────
+# ── Ensemble Predict ───────────────────────────────────────────
 def predict():
     df      = get_usd_inr_data()
     current = get_current_price()
 
-    model = Prophet(
-        changepoint_prior_scale=0.05,
-        daily_seasonality=True,
-        weekly_seasonality=True
-    )
-    model.fit(df)
+    print("🔮 Training models...")
+    xgb_pred  = xgboost_predict(df)
+    print("✅ XGBoost done")
+    lstm_pred = lstm_predict(df)
+    print("✅ LSTM done")
 
     results = {"current": current, "predictions": {}}
 
-    for label, freq in HORIZONS.items():
-        minutes  = int(freq.replace("min", ""))
-        future   = model.make_future_dataframe(periods=1, freq=f"{minutes}min")
-        forecast = model.predict(future)
+    for label, minutes in HORIZONS.items():
+        prophet_pred, upper, lower = prophet_predict(df, minutes)
+        print(f"✅ Prophet done for {label}")
 
-        predicted  = round(forecast['yhat'].iloc[-1], 4)
-        upper      = round(forecast['yhat_upper'].iloc[-1], 4)
-        lower      = round(forecast['yhat_lower'].iloc[-1], 4)
-        change     = round(predicted - current, 4)
+        if minutes <= 60:
+            weights = {"prophet": 0.2, "lstm": 0.4, "xgb": 0.4}
+        elif minutes <= 360:
+            weights = {"prophet": 0.3, "lstm": 0.35, "xgb": 0.35}
+        else:
+            weights = {"prophet": 0.5, "lstm": 0.25, "xgb": 0.25}
+
+        ensemble   = round(
+            weights["prophet"] * prophet_pred +
+            weights["lstm"]    * lstm_pred +
+            weights["xgb"]     * xgb_pred, 4
+        )
+        change     = round(ensemble - current, 4)
         pct        = round((change / current) * 100, 3)
-        confidence = round((upper - lower) / predicted, 5)
+        confidence = round((upper - lower) / prophet_pred, 5)
         signal     = get_signal(pct, confidence)
 
         results["predictions"][label] = {
-            "price": predicted, "change": change, "pct": pct,
-            "upper": upper, "lower": lower,
-            "confidence": confidence, "signal": signal
+            "price":      ensemble,
+            "change":     change,
+            "pct":        pct,
+            "upper":      round(upper, 4),
+            "lower":      round(lower, 4),
+            "confidence": confidence,
+            "signal":     signal,
+            "breakdown":  {
+                "prophet": round(prophet_pred, 4),
+                "lstm":    lstm_pred,
+                "xgb":     xgb_pred,
+            }
         }
 
     return results
@@ -123,7 +227,7 @@ def generate_graph(data, horizon=None):
 
     if horizon:
         vals   = preds[horizon]
-        t_end  = now + timedelta(minutes=OFFSET_MINS[horizon])
+        t_end  = now + timedelta(minutes=HORIZONS[horizon])
         times  = [now, t_end]
         prices = [current, vals['price']]
         uppers = [current, vals['upper']]
@@ -131,7 +235,7 @@ def generate_graph(data, horizon=None):
         color  = SIGNAL_COLORS.get(vals['signal'], "#90a4ae")
 
         ax.plot(times, prices, color=color, linewidth=2.5, marker='o', markersize=7)
-        ax.fill_between(times, lowers, uppers, color=color, alpha=0.15, label="Confidence Band")
+        ax.fill_between(times, lowers, uppers, color=color, alpha=0.15)
 
         sign = "+" if vals['change'] >= 0 else ""
         ax.annotate(
@@ -141,10 +245,18 @@ def generate_graph(data, horizon=None):
             color=color, fontsize=10, fontweight='bold',
             bbox=dict(boxstyle='round,pad=0.3', facecolor='#2e2e3e', edgecolor=color)
         )
-        ax.set_title(f"USD/INR — {horizon} Forecast", color='white', fontsize=14, fontweight='bold')
+        bd = vals['breakdown']
+        ax.annotate(
+            f"Prophet: {bd['prophet']}\nLSTM:  {bd['lstm']}\nXGB:   {bd['xgb']}",
+            xy=(now, current),
+            xytext=(10, -40), textcoords='offset points',
+            color='#aaaacc', fontsize=8,
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='#2e2e3e', edgecolor='#444466')
+        )
+        ax.set_title(f"USD/INR — {horizon} Ensemble Forecast", color='white', fontsize=14, fontweight='bold')
 
     else:
-        times  = [now] + [now + timedelta(minutes=OFFSET_MINS[h]) for h in preds]
+        times  = [now] + [now + timedelta(minutes=HORIZONS[h]) for h in preds]
         prices = [current] + [v['price'] for v in preds.values()]
 
         ax.plot(times, prices, color="#7c83ff", linewidth=2, alpha=0.4, zorder=1)
@@ -160,7 +272,7 @@ def generate_graph(data, horizon=None):
                 color='white', fontsize=7, ha='center', rotation=20
             )
 
-        ax.set_title("USD/INR — All Horizons Forecast", color='white', fontsize=14, fontweight='bold')
+        ax.set_title("USD/INR — All Horizons Ensemble Forecast", color='white', fontsize=14, fontweight='bold')
         patches = [mpatches.Patch(color=c, label=s) for s, c in SIGNAL_COLORS.items()]
         ax.legend(handles=patches, facecolor='#2e2e3e', labelcolor='white', fontsize=8)
 
@@ -203,19 +315,23 @@ def format_single(data, horizon):
     current = data['current']
     sign    = "+" if vals['change'] >= 0 else ""
     arrow   = "📈" if vals['change'] >= 0 else "📉"
+    bd      = vals['breakdown']
     return (
         f"💱 *USD/INR — {horizon}*\n"
         f"📍 Current:    `{current}`\n"
-        f"{arrow} Predicted:  `{vals['price']}` ({sign}{vals['pct']}%)\n"
+        f"{arrow} Ensemble:  `{vals['price']}` ({sign}{vals['pct']}%)\n"
         f"📶 Signal:      {vals['signal']}\n"
-        f"📏 Range:       `{vals['lower']}` – `{vals['upper']}`\n"
-        f"🎯 Confidence: `{vals['confidence']}`\n\n"
+        f"📏 Range:       `{vals['lower']}` – `{vals['upper']}`\n\n"
+        f"🔬 *Model Breakdown:*\n"
+        f"  • Prophet: `{bd['prophet']}`\n"
+        f"  • LSTM:      `{bd['lstm']}`\n"
+        f"  • XGBoost: `{bd['xgb']}`\n\n"
         f"_⚠️ Not financial advice._"
     )
 
 def format_all(data):
     current = data['current']
-    lines   = [f"💱 *USD/INR Full Forecast*\n📍 Current: `{current}`\n"]
+    lines   = [f"💱 *USD/INR Ensemble Forecast*\n📍 Current: `{current}`\n"]
     for h, vals in data['predictions'].items():
         sign  = "+" if vals['change'] >= 0 else ""
         arrow = "📈" if vals['change'] >= 0 else "📉"
@@ -238,7 +354,7 @@ async def set_commands(app):
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Welcome to USD/INR Forecast Bot!*\n\n"
-        "🔮 Powered by Prophet ML model\n\n"
+        "🔮 Powered by Prophet + LSTM + XGBoost Ensemble\n\n"
         "📌 *Commands:*\n"
         "/predict — Full forecast (all horizons)\n"
         "/quick   — Short-term signals (10m–1hr)\n"
@@ -259,7 +375,7 @@ async def choose_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def predict_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ Running full forecast...")
+    msg = await update.message.reply_text("⏳ Running ensemble forecast (Prophet + LSTM + XGBoost)...")
     try:
         data  = predict()
         graph = generate_graph(data)
@@ -302,8 +418,11 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "⚪ *HOLD*             → low move or uncertain\n"
         "🟥 *SELL*              → -0.03% to -0.08%\n"
         "🔴 *STRONG SELL* → -0.08% or more\n\n"
-        "📏 *Range* = Prophet confidence interval\n"
-        "🎯 *Confidence* = lower is more certain\n\n"
+        "🔬 *Models Used:*\n"
+        "  • Prophet — trend & seasonality\n"
+        "  • LSTM — deep learning patterns\n"
+        "  • XGBoost — feature-based learning\n\n"
+        "📏 *Range* = Prophet confidence interval\n\n"
         "_⚠️ This bot is for informational purposes only. Not financial advice._",
         parse_mode="Markdown"
     )
@@ -324,7 +443,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data_str.startswith("horizon:"):
         horizon = data_str.split("horizon:")[1]
-        await query.edit_message_text("⏳ Fetching prediction...")
+        await query.edit_message_text("⏳ Running ensemble prediction...")
         try:
             data = predict()
             if horizon == "ALL":
